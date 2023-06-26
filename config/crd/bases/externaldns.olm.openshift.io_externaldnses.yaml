@@ -572,6 +572,16 @@ spec:
                     description: AWS describes provider configuration options specific
                       to AWS (Route 53).
                     properties:
+                      assumeRole:
+                        description: AssumeRole is a reference to the IAM role that
+                          the controller will be assuming in order to perform any
+                          DNS updates.
+                        properties:
+                          arn:
+                            description: ARN is an AWS role ARN that the external-dns
+                              operator will assume when making DNS updates.
+                            type: string
+                        type: object
                       credentials:
                         description: "Credentials is a reference to a secret containing
                           the following keys (with corresponding values): \n * aws_access_key_id
