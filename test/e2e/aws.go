@@ -5,6 +5,7 @@ package e2e
 
 import (
 	"fmt"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -21,12 +22,13 @@ import (
 )
 
 type awsTestHelper struct {
-	r53Client *route53.Route53
-	keyID     string
-	secretKey string
+	r53Client           *route53.Route53
+	r53AssumeRoleClient *route53.Route53
+	keyID               string
+	secretKey           string
 }
 
-func newAWSHelper(isOpenShiftCI bool, kubeClient client.Client) (providerTestHelper, error) {
+func newAWSHelper(isOpenShiftCI bool, kubeClient client.Client, assumeRoleARN string) (providerTestHelper, error) {
 	provider := &awsTestHelper{}
 	if err := provider.prepareConfigurations(isOpenShiftCI, kubeClient); err != nil {
 		return nil, err
@@ -37,6 +39,13 @@ func newAWSHelper(isOpenShiftCI bool, kubeClient client.Client) (providerTestHel
 	}))
 
 	provider.r53Client = route53.New(awsSession)
+
+	if assumeRoleARN != "" {
+		sessRoute53 := awsSession.Copy()
+		sessRoute53.Config.WithCredentials(stscreds.NewCredentials(sessRoute53, assumeRoleARN))
+		provider.r53AssumeRoleClient = route53.New(sessRoute53)
+	}
+
 	return provider, nil
 }
 
@@ -183,4 +192,30 @@ func (a *awsTestHelper) prepareConfigurations(isOpenShiftCI bool, kubeClient cli
 		a.secretKey = mustGetEnv("AWS_SECRET_ACCESS_KEY")
 	}
 	return nil
+}
+
+func (a *awsTestHelper) getDNSRecordValueInSharedVPCZone(zoneId, recordName, recordType string) (map[string]struct{}, error) {
+	records, err := a.r53SharedVPC.ListResourceRecordSets(&route53.ListResourceRecordSetsInput{
+		HostedZoneId:    &zoneId,
+		StartRecordName: &recordName,
+		StartRecordType: &recordType,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list resource record sets: %w", err)
+	}
+	//*route53.Route53.ListRe
+	if len(records.ResourceRecordSets) == 0 {
+		return nil, nil
+	}
+
+	recordList := make(map[string]struct{})
+	if records.ResourceRecordSets[0].AliasTarget != nil {
+		recordList[*records.ResourceRecordSets[0].AliasTarget.DNSName] = struct{}{}
+	} else {
+		for _, record := range records.ResourceRecordSets[0].ResourceRecords {
+			recordList[*record.Value] = struct{}{}
+		}
+	}
+
+	return recordList, nil
 }

@@ -4,14 +4,9 @@
 package e2e
 
 import (
+	"bufio"
 	"context"
 	"fmt"
-	"os"
-	"strconv"
-	"strings"
-	"testing"
-	"time"
-
 	operatorv1 "github.com/openshift/api/operator/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -21,7 +16,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	kscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/pointer"
+	"os"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
 	olmv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
@@ -54,12 +56,14 @@ const (
 )
 
 var (
-	kubeClient       client.Client
-	scheme           *runtime.Scheme
-	nameServers      []string
-	hostedZoneID     string
-	helper           providerTestHelper
-	hostedZoneDomain = baseZoneDomain
+	kubeClient         client.Client
+	kubeClientSet      *kubernetes.Clientset
+	scheme             *runtime.Scheme
+	nameServers        []string
+	hostedZoneID       string
+	helper             providerTestHelper
+	hostedZoneDomain   = baseZoneDomain
+	privateZoneIAMRole string
 )
 
 func init() {
@@ -94,13 +98,20 @@ func initKubeClient() error {
 	if err != nil {
 		return fmt.Errorf("failed to create kube client: %w", err)
 	}
+
+	kubeClientSet, err = kubernetes.NewForConfig(kubeConfig)
+	if err != nil {
+		fmt.Printf("failed to create kube clientset: %s\n", err)
+		os.Exit(1)
+	}
+
 	return nil
 }
 
-func initProviderHelper(openshiftCI bool, platformType string) (providerTestHelper, error) {
+func initProviderHelper(openshiftCI bool, platformType, privateZoneIAMRole string) (providerTestHelper, error) {
 	switch platformType {
 	case string(configv1.AWSPlatformType):
-		return newAWSHelper(openshiftCI, kubeClient)
+		return newAWSHelper(openshiftCI, kubeClient, privateZoneIAMRole)
 	case string(configv1.AzurePlatformType):
 		return newAzureHelper(kubeClient)
 	case string(configv1.GCPPlatformType):
@@ -151,7 +162,15 @@ func TestMain(m *testing.M) {
 		hostedZoneDomain = strconv.FormatInt(time.Now().Unix(), 10) + "." + version.SHORTCOMMIT + "." + baseZoneDomain
 	}
 
-	if helper, err = initProviderHelper(openshiftCI, platformType); err != nil {
+	dnsConfig := configv1.DNS{}
+	err = kubeClient.Get(context.TODO(), types.NamespacedName{Name: "cluster"}, &dnsConfig)
+	if err != nil {
+		fmt.Printf("failed to get dns 'cluster': %v\n", err)
+		os.Exit(1)
+	}
+	privateZoneIAMRole = dnsConfig.Spec.Platform.AWS.PrivateZoneIAMRole
+
+	if helper, err = initProviderHelper(openshiftCI, platformType, privateZoneIAMRole); err != nil {
 		fmt.Printf("Failed to init provider helper: %v\n", err)
 		os.Exit(1)
 	}
@@ -311,46 +330,9 @@ func TestExternalDNSRecordLifecycle(t *testing.T) {
 		_ = kubeClient.Delete(context.TODO(), service)
 	}()
 
-	serviceIPs := make(map[string]struct{})
-	// get the IPs of the loadbalancer which is created for the service
-	if err := wait.PollUntilContextTimeout(context.TODO(), dnsPollingInterval, dnsPollingTimeout, true, func(ctx context.Context) (done bool, err error) {
-		t.Log("Getting IPs of service's load balancer")
-		var service corev1.Service
-		err = kubeClient.Get(ctx, types.NamespacedName{
-			Namespace: testNamespace,
-			Name:      testServiceName,
-		}, &service)
-		if err != nil {
-			return false, err
-		}
-
-		// if there is no associated loadbalancer then retry later
-		if len(service.Status.LoadBalancer.Ingress) < 1 {
-			return false, nil
-		}
-
-		// get the IPs of the loadbalancer
-		if service.Status.LoadBalancer.Ingress[0].IP != "" {
-			serviceIPs[service.Status.LoadBalancer.Ingress[0].IP] = struct{}{}
-		} else if service.Status.LoadBalancer.Ingress[0].Hostname != "" {
-			lbHostname := service.Status.LoadBalancer.Ingress[0].Hostname
-			ips, err := lookupARecord(lbHostname, googleDNSServer)
-			if err != nil {
-				t.Logf("Waiting for IP of loadbalancer %s", lbHostname)
-				// if the hostname cannot be resolved currently then retry later
-				return false, nil
-			}
-			for _, ip := range ips {
-				serviceIPs[ip] = struct{}{}
-			}
-		} else {
-			t.Logf("Waiting for loadbalancer details for service %s", testServiceName)
-			return false, nil
-		}
-		t.Logf("Loadbalancer's IP(s): %v", serviceIPs)
-		return true, nil
-	}); err != nil {
-		t.Fatalf("Failed to get loadbalancer IPs for service %s/%s: %v", testNamespace, testServiceName, err)
+	serviceIPs, err := getServiceIP(t)
+	if err != nil {
+		t.Fatalf("Failed to get service IPs: %v", err)
 	}
 
 	// try all nameservers and fail only if all failed
@@ -678,7 +660,291 @@ func TestExternalDNSSecretCredentialUpdate(t *testing.T) {
 	}
 }
 
+func TestExternalDNSAssumeRoleInSharedRoute53(t *testing.T) {
+	dnsConfig := configv1.DNS{}
+	err := kubeClient.Get(context.TODO(), types.NamespacedName{Name: "cluster"}, &dnsConfig)
+	if err != nil {
+		t.Errorf("failed to get dns 'cluster': %v", err)
+	}
+	privateZoneIAMRole := dnsConfig.Spec.Platform.AWS.PrivateZoneIAMRole
+	if privateZoneIAMRole == "" {
+		t.Skipf("test skipped on non-shared-route53 cluster")
+	}
+
+	t.Log("Ensuring test namespace")
+	err = kubeClient.Create(context.TODO(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNamespace}})
+	if err != nil && !errors.IsAlreadyExists(err) {
+		t.Fatalf("Failed to ensure namespace %s: %v", testNamespace, err)
+	}
+
+	// secret is needed only for DNS providers which cannot get their credentials from CCO
+	// namely Infobox, BlueCat
+	t.Log("Creating credentials secret")
+	credSecret := helper.makeCredentialsSecret(operatorNamespace)
+	err = kubeClient.Create(context.TODO(), credSecret)
+	if err != nil {
+		t.Fatalf("Failed to create credentials secret %s/%s: %v", credSecret.Namespace, credSecret.Name, err)
+	}
+
+	extDNS := helper.buildExternalDNS(testExtDNSName, dnsConfig.Spec.PrivateZone.ID, dnsConfig.Spec.BaseDomain, credSecret)
+	extDNS.Spec.Provider.AWS.AssumeRole = &operatorv1beta1.ExternalDNSAWSAssumeRoleOptions{
+		ARN: &privateZoneIAMRole,
+	}
+	if err := kubeClient.Create(context.TODO(), &extDNS); err != nil {
+		t.Fatalf("Failed to create external DNS %q: %v", testExtDNSName, err)
+	}
+	defer func() {
+		_ = kubeClient.Delete(context.TODO(), &extDNS)
+	}()
+
+	// create a service of type LoadBalancer with the annotation targeted by the ExternalDNS resource
+	t.Log("Creating source service")
+	service := defaultService(testServiceName, testNamespace)
+	if err := kubeClient.Create(context.TODO(), service); err != nil {
+		t.Fatalf("Failed to create test service %s/%s: %v", testNamespace, testServiceName, err)
+	}
+	defer func() {
+		_ = kubeClient.Delete(context.TODO(), service)
+	}()
+
+	serviceIPs, err := getServiceIP(t)
+	if err != nil {
+		t.Fatalf("Failed to get service IPs: %v", err)
+	}
+
+	expectedHost := fmt.Sprintf("%s.%s", testServiceName, dnsConfig.Spec.BaseDomain)
+	if err := wait.PollUntilContextTimeout(context.TODO(), dnsPollingInterval, dnsPollingTimeout, true, func(ctx context.Context) (done bool, err error) {
+		recordValues, err := helper.getDNSRecordValueInSharedVPCZone(dnsConfig.Spec.PrivateZone.ID, expectedHost, "A")
+		if err != nil {
+			t.Errorf("failed to get DNS record for shared VPC zone: %v", err)
+			return false, nil
+		} else if len(recordValues) == 0 {
+			t.Errorf("no DNS records with name %q", expectedHost)
+			return false, nil
+		}
+		// all expected IPs should be in the received IPs
+		// but these 2 sets are not necessary equal
+		for ip := range serviceIPs {
+			if _, found := recordValues[ip]; !found {
+				t.Errorf("DNS record with name %q didn't contain expected service IP %q", expectedHost, ip)
+				return false, nil
+			}
+		}
+		t.Logf("DNS record with name %q found in shared Route 53 private zone %q and matched service IPs", expectedHost, dnsConfig.Spec.PrivateZone.ID)
+		return true, nil
+	}); err != nil {
+		t.Fatalf("failed to observe the DNS record properly configured in shared VPC zone: %v", err)
+	}
+
+	t.Logf("Looking for DNS record inside cluster VPC")
+
+	// verify that the IPs of the record created by ExternalDNS match the IPs of loadbalancer obtained in the previous step.
+	if err := wait.PollUntilContextTimeout(context.TODO(), dnsPollingInterval, dnsPollingTimeout, true, func(ctx context.Context) (done bool, err error) {
+
+		clientPod := buildDigPod("digpod", testNamespace, expectedHost)
+		if err := kubeClient.Create(context.TODO(), clientPod); err != nil {
+			t.Fatalf("failed to create pod %s/%s: %v", clientPod.Namespace, clientPod.Name, err)
+		}
+		defer func() {
+			_ = kubeClient.Delete(context.TODO(), clientPod)
+		}()
+
+		var responseCode string
+		var gotIPs map[string]struct{}
+		err = wait.PollUntilContextTimeout(context.TODO(), 5*time.Second, 10*time.Minute, true, func(ctx context.Context) (bool, error) {
+			if err := kubeClient.Get(context.TODO(), types.NamespacedName{Name: clientPod.Name, Namespace: clientPod.Namespace}, clientPod); err != nil {
+				t.Errorf("failed to get pod %s/%s: %v", clientPod.Namespace, clientPod.Name, err)
+				return false, nil
+			}
+			switch clientPod.Status.Phase {
+			case corev1.PodRunning:
+				t.Log("waiting for pod to stop running")
+				return false, nil
+			case corev1.PodPending:
+				t.Log("waiting for pod to start")
+				return false, nil
+			case corev1.PodFailed, corev1.PodSucceeded:
+				break
+			default:
+				t.Fatalf("unhandled pod status type")
+			}
+
+			readCloser, err := kubeClientSet.CoreV1().Pods(clientPod.Namespace).GetLogs(clientPod.Name, &corev1.PodLogOptions{
+				Container: clientPod.Spec.Containers[0].Name,
+				Follow:    false,
+			}).Stream(ctx)
+			if err != nil {
+				t.Logf("failed to read output from pod %s: %v (retrying)", clientPod.Name, err)
+				return false, nil
+			}
+			scanner := bufio.NewScanner(readCloser)
+			defer func() {
+				if err := readCloser.Close(); err != nil {
+					t.Fatalf("failed to close reader for pod %s: %v", clientPod.Name, err)
+				}
+			}()
+
+			gotIPs = make(map[string]struct{})
+			for scanner.Scan() {
+				line := scanner.Text()
+				fmt.Println(line)
+
+				// Skip blank lines
+				if strings.TrimSpace(line) == "" {
+					continue
+				}
+				// Parse status out
+				if strings.HasPrefix(line, ";;") && strings.Contains(line, "status:") {
+					responseCodeSection := strings.TrimSpace(strings.Split(line, ",")[1])
+					responseCode = strings.Split(responseCodeSection, " ")[1]
+				}
+				// If it doesn't begin with ";", then we have an answer
+				if !strings.HasPrefix(line, ";") {
+					gotIP := strings.Fields(line)[4]
+					gotIPs[gotIP] = struct{}{}
+				}
+			}
+			return true, nil
+		})
+		if err != nil {
+			t.Fatalf("failed to observe the expected log message: %v", err)
+		}
+
+		t.Logf("Got IPs: %v", gotIPs)
+		t.Logf("DNS Status: %s", responseCode)
+
+		waitForDeletion(context.TODO(), t, kubeClient, clientPod, 5*time.Minute)
+
+		// If all IPs of the loadbalancer are not present query again.
+		if len(gotIPs) == 0 {
+			return false, nil
+		}
+		if len(gotIPs) < len(serviceIPs) {
+			return false, nil
+		}
+		// all expected IPs should be in the received IPs
+		// but these 2 sets are not necessary equal
+		for ip := range serviceIPs {
+			if _, found := gotIPs[ip]; !found {
+				return false, nil
+			}
+		}
+		t.Log("all IPs are equal")
+		return true, nil
+	}); err != nil {
+		t.Logf("Failed to verify that DNS has been correctly set.")
+	} else {
+		return
+	}
+	t.Fatalf("All nameservers failed to verify that DNS has been correctly set.")
+
+}
+
 // HELPER FUNCTIONS
+
+// buildDigPod returns a pod definition for a pod with the given name and image
+// and in the given namespace that digs the specified address.
+func buildDigPod(name, namespace, address string, extraArgs ...string) *corev1.Pod {
+	digArgs := []string{
+		"+noall",
+		"+answer",
+		"+comments",
+	}
+	digArgs = append(digArgs, extraArgs...)
+	digArgs = append(digArgs, address)
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:    "dig",
+					Image:   "openshift/origin-node",
+					Command: []string{"/bin/dig"},
+					Args:    digArgs,
+					SecurityContext: &corev1.SecurityContext{
+						Capabilities: &corev1.Capabilities{
+							Drop: []corev1.Capability{corev1.Capability("ALL")},
+						},
+						Privileged:               pointer.Bool(false),
+						RunAsNonRoot:             pointer.Bool(true),
+						AllowPrivilegeEscalation: pointer.Bool(false),
+						SeccompProfile: &corev1.SeccompProfile{
+							Type: corev1.SeccompProfileTypeRuntimeDefault,
+						},
+					},
+				},
+			},
+			RestartPolicy: corev1.RestartPolicyNever,
+		},
+	}
+}
+
+func getServiceIP(t *testing.T) (map[string]struct{}, error) {
+	t.Helper()
+	serviceIPs := make(map[string]struct{})
+	// get the IPs of the loadbalancer which is created for the service
+	if err := wait.PollUntilContextTimeout(context.TODO(), dnsPollingInterval, dnsPollingTimeout, true, func(ctx context.Context) (done bool, err error) {
+		t.Log("Getting IPs of service's load balancer")
+		var service corev1.Service
+		err = kubeClient.Get(ctx, types.NamespacedName{
+			Namespace: testNamespace,
+			Name:      testServiceName,
+		}, &service)
+		if err != nil {
+			return false, err
+		}
+
+		// if there is no associated loadbalancer then retry later
+		if len(service.Status.LoadBalancer.Ingress) < 1 {
+			return false, nil
+		}
+
+		// get the IPs of the loadbalancer
+		if service.Status.LoadBalancer.Ingress[0].IP != "" {
+			serviceIPs[service.Status.LoadBalancer.Ingress[0].IP] = struct{}{}
+		} else if service.Status.LoadBalancer.Ingress[0].Hostname != "" {
+			lbHostname := service.Status.LoadBalancer.Ingress[0].Hostname
+			ips, err := lookupARecord(lbHostname, googleDNSServer)
+			if err != nil {
+				t.Logf("Waiting for IP of loadbalancer %s", lbHostname)
+				// if the hostname cannot be resolved currently then retry later
+				return false, nil
+			}
+			for _, ip := range ips {
+				serviceIPs[ip] = struct{}{}
+			}
+		} else {
+			t.Logf("Waiting for loadbalancer details for service %s", testServiceName)
+			return false, nil
+		}
+		t.Logf("Loadbalancer's IP(s): %v", serviceIPs)
+		return true, nil
+	}); err != nil {
+		return nil, fmt.Errorf("Failed to get loadbalancer IPs for service %s/%s: %v", testNamespace, testServiceName, err)
+	}
+
+	return serviceIPs, nil
+}
+
+func waitForDeletion(ctx context.Context, t *testing.T, cl client.Client, obj client.Object, timeout time.Duration) {
+	t.Helper()
+	deletionPolicy := metav1.DeletePropagationForeground
+	_ = wait.PollUntilContextTimeout(ctx, 10*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+		err := cl.Delete(ctx, obj, &client.DeleteOptions{PropagationPolicy: &deletionPolicy})
+		if err != nil && !errors.IsNotFound(err) {
+			t.Logf("failed to delete resource %s/%s: %v", obj.GetNamespace(), obj.GetName(), err)
+			return false, nil
+		} else if err == nil {
+			t.Logf("retrying deletion of resource %s/%s", obj.GetNamespace(), obj.GetName())
+			return false, nil
+		}
+		t.Logf("deleted resource %s/%s", obj.GetNamespace(), obj.GetName())
+		return true, nil
+	})
+}
 
 func ensureOperandResources() error {
 	if os.Getenv(e2eSeparateOperandNsEnvVar) != "true" {

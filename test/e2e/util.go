@@ -46,6 +46,7 @@ type providerTestHelper interface {
 	buildExternalDNS(name, zoneID, zoneDomain string, credsSecret *corev1.Secret) operatorv1beta1.ExternalDNS
 	buildOpenShiftExternalDNS(name, zoneID, zoneDomain, routeName string, credsSecret *corev1.Secret) operatorv1beta1.ExternalDNS
 	buildOpenShiftExternalDNSV1Alpha1(name, zoneID, zoneDomain, routeName string, credsSecret *corev1.Secret) operatorv1alpha1.ExternalDNS
+	getDNSRecordValueInSharedVPCZone(zoneId, recordName, recordType string) (map[string]struct{}, error)
 }
 
 func randomString(n int) string {
