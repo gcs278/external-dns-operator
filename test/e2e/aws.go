@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/route53"
+
 	configv1 "github.com/openshift/api/config/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,9 +24,10 @@ import (
 )
 
 type awsTestHelper struct {
-	r53Client *route53.Route53
-	keyID     string
-	secretKey string
+	awsSession *session.Session
+	r53Client  *route53.Route53
+	keyID      string
+	secretKey  string
 }
 
 func newAWSHelper(isOpenShiftCI bool, kubeClient client.Client) (providerTestHelper, error) {
@@ -32,11 +36,12 @@ func newAWSHelper(isOpenShiftCI bool, kubeClient client.Client) (providerTestHel
 		return nil, err
 	}
 
-	awsSession := session.Must(session.NewSession(&aws.Config{
+	provider.awsSession = session.Must(session.NewSession(&aws.Config{
 		Credentials: credentials.NewStaticCredentials(provider.keyID, provider.secretKey, ""),
 	}))
 
-	provider.r53Client = route53.New(awsSession)
+	provider.r53Client = route53.New(provider.awsSession)
+
 	return provider, nil
 }
 
@@ -183,4 +188,38 @@ func (a *awsTestHelper) prepareConfigurations(isOpenShiftCI bool, kubeClient cli
 		a.secretKey = mustGetEnv("AWS_SECRET_ACCESS_KEY")
 	}
 	return nil
+}
+
+func (a *awsTestHelper) createAssumeRoleRoute53Client(assumeRoleARN string) *route53.Route53 {
+	sessRoute53 := a.awsSession.Copy()
+	sessRoute53.Config.WithCredentials(stscreds.NewCredentials(sessRoute53, assumeRoleARN))
+	r53AssumeRoleClient := route53.New(sessRoute53)
+	return r53AssumeRoleClient
+}
+
+func (a *awsTestHelper) getDNSRecordValuesWithAssumeRole(assumeRoleARN, zoneId, recordName, recordType string) (map[string]struct{}, error) {
+	r53AssumeRoleClient := a.createAssumeRoleRoute53Client(assumeRoleARN)
+	records, err := r53AssumeRoleClient.ListResourceRecordSets(&route53.ListResourceRecordSetsInput{
+		HostedZoneId:    &zoneId,
+		StartRecordName: &recordName,
+		StartRecordType: &recordType,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list resource record sets: %w", err)
+	}
+
+	if len(records.ResourceRecordSets) == 0 {
+		return nil, nil
+	}
+
+	recordList := make(map[string]struct{})
+	if records.ResourceRecordSets[0].AliasTarget != nil {
+		recordList[*records.ResourceRecordSets[0].AliasTarget.DNSName] = struct{}{}
+	} else {
+		for _, record := range records.ResourceRecordSets[0].ResourceRecords {
+			recordList[*record.Value] = struct{}{}
+		}
+	}
+
+	return recordList, nil
 }

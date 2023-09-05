@@ -194,3 +194,7 @@ func getGCPProjectId(kubeClient client.Client) (string, error) {
 	}
 	return infraConfig.Status.PlatformStatus.GCP.ProjectID, nil
 }
+
+func (g *gcpTestHelper) getDNSRecordValuesWithAssumeRole(assumeRoleARN, zoneId, recordName, recordType string) (map[string]struct{}, error) {
+	panic("not implemented")
+}

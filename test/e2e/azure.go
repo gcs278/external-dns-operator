@@ -183,3 +183,7 @@ func getAccessToken(cfg *clusterConfig) (*adal.ServicePrincipalToken, error) {
 	}
 	return nil, fmt.Errorf("no credentials provided for Azure API")
 }
+
+func (a *azureTestHelper) getDNSRecordValuesWithAssumeRole(assumeRoleARN, zoneId, recordName, recordType string) (map[string]struct{}, error) {
+	panic("not implemented")
+}

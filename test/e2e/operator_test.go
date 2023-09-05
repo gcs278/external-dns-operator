@@ -12,26 +12,27 @@ import (
 	"testing"
 	"time"
 
+	configv1 "github.com/openshift/api/config/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
 	routev1 "github.com/openshift/api/route/v1"
+
+	operatorv1alpha1 "github.com/openshift/external-dns-operator/api/v1alpha1"
+	operatorv1beta1 "github.com/openshift/external-dns-operator/api/v1beta1"
+	"github.com/openshift/external-dns-operator/pkg/version"
+
+	olmv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	kscheme "k8s.io/client-go/kubernetes/scheme"
-
-	configv1 "github.com/openshift/api/config/v1"
-	olmv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
-
-	operatorv1alpha1 "github.com/openshift/external-dns-operator/api/v1alpha1"
-	operatorv1beta1 "github.com/openshift/external-dns-operator/api/v1beta1"
-	"github.com/openshift/external-dns-operator/pkg/version"
 )
 
 const (
@@ -46,7 +47,6 @@ const (
 	operatorServiceAccount     = "external-dns-operator"
 	dnsPollingInterval         = 15 * time.Second
 	dnsPollingTimeout          = 3 * time.Minute
-	googleDNSServer            = "8.8.8.8"
 	infobloxDNSProvider        = "INFOBLOX"
 	dnsProviderEnvVar          = "DNS_PROVIDER"
 	e2eSkipDNSProvidersEnvVar  = "E2E_SKIP_DNS_PROVIDERS"
@@ -55,6 +55,7 @@ const (
 
 var (
 	kubeClient       client.Client
+	kubeClientSet    *kubernetes.Clientset
 	scheme           *runtime.Scheme
 	nameServers      []string
 	hostedZoneID     string
@@ -94,6 +95,13 @@ func initKubeClient() error {
 	if err != nil {
 		return fmt.Errorf("failed to create kube client: %w", err)
 	}
+
+	kubeClientSet, err = kubernetes.NewForConfig(kubeConfig)
+	if err != nil {
+		fmt.Printf("failed to create kube clientset: %s\n", err)
+		os.Exit(1)
+	}
+
 	return nil
 }
 
@@ -311,46 +319,10 @@ func TestExternalDNSRecordLifecycle(t *testing.T) {
 		_ = kubeClient.Delete(context.TODO(), service)
 	}()
 
-	serviceIPs := make(map[string]struct{})
-	// get the IPs of the loadbalancer which is created for the service
-	if err := wait.PollUntilContextTimeout(context.TODO(), dnsPollingInterval, dnsPollingTimeout, true, func(ctx context.Context) (done bool, err error) {
-		t.Log("Getting IPs of service's load balancer")
-		var service corev1.Service
-		err = kubeClient.Get(ctx, types.NamespacedName{
-			Namespace: testNamespace,
-			Name:      testServiceName,
-		}, &service)
-		if err != nil {
-			return false, err
-		}
-
-		// if there is no associated loadbalancer then retry later
-		if len(service.Status.LoadBalancer.Ingress) < 1 {
-			return false, nil
-		}
-
-		// get the IPs of the loadbalancer
-		if service.Status.LoadBalancer.Ingress[0].IP != "" {
-			serviceIPs[service.Status.LoadBalancer.Ingress[0].IP] = struct{}{}
-		} else if service.Status.LoadBalancer.Ingress[0].Hostname != "" {
-			lbHostname := service.Status.LoadBalancer.Ingress[0].Hostname
-			ips, err := lookupARecord(lbHostname, googleDNSServer)
-			if err != nil {
-				t.Logf("Waiting for IP of loadbalancer %s", lbHostname)
-				// if the hostname cannot be resolved currently then retry later
-				return false, nil
-			}
-			for _, ip := range ips {
-				serviceIPs[ip] = struct{}{}
-			}
-		} else {
-			t.Logf("Waiting for loadbalancer details for service %s", testServiceName)
-			return false, nil
-		}
-		t.Logf("Loadbalancer's IP(s): %v", serviceIPs)
-		return true, nil
-	}); err != nil {
-		t.Fatalf("Failed to get loadbalancer IPs for service %s/%s: %v", testNamespace, testServiceName, err)
+	// Get the resolved service IPs of the load balancer
+	_, serviceIPs, err := getServiceIPs(context.TODO(), t, kubeClient, dnsPollingTimeout, types.NamespacedName{Name: testServiceName, Namespace: testNamespace})
+	if err != nil {
+		t.Fatalf("failed to get service IPs %s/%s: %v", testNamespace, testServiceName, err)
 	}
 
 	// try all nameservers and fail only if all failed
@@ -582,46 +554,10 @@ func TestExternalDNSSecretCredentialUpdate(t *testing.T) {
 		_ = kubeClient.Delete(context.TODO(), service)
 	}()
 
-	serviceIPs := make(map[string]struct{})
-	// get the IPs of the loadbalancer which is created for the service
-	if err := wait.PollUntilContextTimeout(context.TODO(), dnsPollingInterval, dnsPollingTimeout, true, func(ctx context.Context) (done bool, err error) {
-		t.Log("Getting IPs of service's load balancer")
-		var service corev1.Service
-		err = kubeClient.Get(ctx, types.NamespacedName{
-			Namespace: testNamespace,
-			Name:      testService,
-		}, &service)
-		if err != nil {
-			return false, err
-		}
-
-		// if there is no associated loadbalancer then retry later
-		if len(service.Status.LoadBalancer.Ingress) < 1 {
-			return false, nil
-		}
-
-		// get the IPs of the loadbalancer
-		if service.Status.LoadBalancer.Ingress[0].IP != "" {
-			serviceIPs[service.Status.LoadBalancer.Ingress[0].IP] = struct{}{}
-		} else if service.Status.LoadBalancer.Ingress[0].Hostname != "" {
-			lbHostname := service.Status.LoadBalancer.Ingress[0].Hostname
-			ips, err := lookupARecord(lbHostname, googleDNSServer)
-			if err != nil {
-				t.Logf("Waiting for IP of loadbalancer %s", lbHostname)
-				// if the hostname cannot be resolved currently then retry later
-				return false, nil
-			}
-			for _, ip := range ips {
-				serviceIPs[ip] = struct{}{}
-			}
-		} else {
-			t.Logf("Waiting for loadbalancer details for service %s", testService)
-			return false, nil
-		}
-		t.Logf("Loadbalancer's IP(s): %v", serviceIPs)
-		return true, nil
-	}); err != nil {
-		t.Fatalf("Failed to get loadbalancer IPs for service %s/%s: %v", testNamespace, testService, err)
+	// Get the resolved service IPs of the load balancer
+	_, serviceIPs, err := getServiceIPs(context.TODO(), t, kubeClient, dnsPollingTimeout, types.NamespacedName{Name: testService, Namespace: testNamespace})
+	if err != nil {
+		t.Fatalf("failed to get service IPs %s/%s: %v", testNamespace, testServiceName, err)
 	}
 
 	dnsCheck := make(chan bool)
@@ -676,6 +612,124 @@ func TestExternalDNSSecretCredentialUpdate(t *testing.T) {
 	if resolved := <-dnsCheck; !resolved {
 		t.Fatal("All nameservers failed to verify that DNS has been correctly set.")
 	}
+}
+
+// TestExternalDNSAssumeRole tests the assumeRole functionality in which you can specify a Role ARN to use another
+// account's hosted zone for creating DNS records. Only AWS is supported.
+func TestExternalDNSAssumeRole(t *testing.T) {
+	// Only run this test if the DNS config contains the privateZoneIAMRole which indicates it's a "Shared VPC" cluster.
+	// Note: Only AWS supports privateZoneIAMRole.
+	dnsConfig := configv1.DNS{}
+	err := kubeClient.Get(context.TODO(), types.NamespacedName{Name: "cluster"}, &dnsConfig)
+	if err != nil {
+		t.Errorf("Failed to get dns 'cluster': %v\n", err)
+	}
+	if dnsConfig.Spec.Platform.AWS == nil || dnsConfig.Spec.Platform.AWS.PrivateZoneIAMRole == "" {
+		t.Skipf("Test skipped on non-shared-VPC cluster")
+	}
+
+	t.Log("Ensuring test namespace")
+	err = kubeClient.Create(context.TODO(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNamespace}})
+	if err != nil && !errors.IsAlreadyExists(err) {
+		t.Fatalf("Failed to ensure namespace %s: %v", testNamespace, err)
+	}
+
+	// Use an empty secret in our ExternalDNS object because:
+	// 1. This E2E runs only on OpenShift and AWS, we will have a CredentialsRequest to provide credentials.
+	// 2. To also validate the v1beta1 "workaround" of providing an empty credentials name with assumeRole due to
+	// credentials being required by the CRD. Empty credentials should cause ExternalDNS Operator to use
+	// CredentialsRequest.
+	emptySecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: ""}}
+
+	// Create an External object that uses the role ARN in the dns config to create DNS records in the private DNS
+	// zone in another AWS account route 53.
+	t.Log("Creating ExternalDNS object that assumes role our of private zone in another account's route 53")
+	extDNS := helper.buildExternalDNS(testExtDNSName, dnsConfig.Spec.PrivateZone.ID, dnsConfig.Spec.BaseDomain, emptySecret)
+	extDNS.Spec.Provider.AWS.AssumeRole = &operatorv1beta1.ExternalDNSAWSAssumeRoleOptions{
+		ARN: dnsConfig.Spec.Platform.AWS.PrivateZoneIAMRole,
+	}
+	if err := kubeClient.Create(context.TODO(), &extDNS); err != nil {
+		t.Fatalf("Failed to create external DNS %q: %v", testExtDNSName, err)
+	}
+	defer func() {
+		_ = kubeClient.Delete(context.TODO(), &extDNS)
+	}()
+
+	// Create a service of type LoadBalancer with the annotation targeted by the ExternalDNS resource.
+	t.Log("Creating source service")
+	service := defaultService(testServiceName, testNamespace)
+	if err := kubeClient.Create(context.TODO(), service); err != nil {
+		t.Fatalf("Failed to create test service %s/%s: %v", testNamespace, testServiceName, err)
+	}
+	defer func() {
+		_ = kubeClient.Delete(context.TODO(), service)
+	}()
+
+	// Get the service address (hostname or IP) and the resolved service IPs of the load balancer.
+	serviceAddress, serviceIPs, err := getServiceIPs(context.TODO(), t, kubeClient, dnsPollingTimeout, types.NamespacedName{Name: testServiceName, Namespace: testNamespace})
+	if err != nil {
+		t.Fatalf("failed to get service IPs %s/%s: %v", testNamespace, testServiceName, err)
+	}
+
+	// Query Route 53 API with assume role ARN from the dns config, then compare the results to ensure it matches the
+	// service hostname.
+	t.Logf("Querying Route 53 API to confirm DNS record exists in a different AWS account")
+	expectedHost := fmt.Sprintf("%s.%s", testServiceName, dnsConfig.Spec.BaseDomain)
+	if err := wait.PollUntilContextTimeout(context.TODO(), dnsPollingInterval, dnsPollingTimeout, true, func(ctx context.Context) (done bool, err error) {
+		recordValues, err := helper.getDNSRecordValuesWithAssumeRole(dnsConfig.Spec.Platform.AWS.PrivateZoneIAMRole, dnsConfig.Spec.PrivateZone.ID, expectedHost, "A")
+		if err != nil {
+			t.Logf("Failed to get DNS record for shared VPC zone: %v", err)
+			return false, nil
+		} else if len(recordValues) == 0 {
+			t.Logf("No DNS records with name %q", expectedHost)
+			return false, nil
+		}
+
+		if _, found := recordValues[serviceAddress]; !found {
+			if _, foundWithDot := recordValues[serviceAddress+"."]; !foundWithDot {
+				t.Logf("DNS record with name %q didn't contain expected service IP %q", expectedHost, serviceAddress)
+				return false, nil
+			}
+		}
+		t.Logf("DNS record with name %q found in shared Route 53 private zone %q and matched service IPs", expectedHost, dnsConfig.Spec.PrivateZone.ID)
+		return true, nil
+	}); err != nil {
+		t.Fatalf("Failed to verify that DNS has been correctly set.")
+	}
+
+	t.Logf("Querying for DNS record inside cluster VPC using a dig pod")
+
+	// Verify that the IPs of the record created by ExternalDNS match the IPs of load balancer obtained in the previous
+	// step. We will start a pod that runs a dig command for the expected hostname and parse the dig output.
+	if err := wait.PollUntilContextTimeout(context.TODO(), dnsPollingInterval, dnsPollingTimeout, true, func(ctx context.Context) (done bool, err error) {
+		gotIPs, err := dnsQueryClusterInternal(ctx, t, kubeClient, kubeClientSet, testNamespace, expectedHost)
+		if err != nil {
+			t.Errorf("Failed to query hostname inside cluster: %v", err)
+			return false, nil
+		}
+
+		// If all IPs of the loadbalancer are not present, query again.
+		if len(gotIPs) == 0 {
+			return false, nil
+		}
+		if len(gotIPs) < len(serviceIPs) {
+			return false, nil
+		}
+		// All expected IPs should be in the received IPs,
+		// but these 2 sets are not necessary equal.
+		for ip := range serviceIPs {
+			if _, found := gotIPs[ip]; !found {
+				return false, nil
+			}
+		}
+		t.Log("Expected IPs are equal to IPs resolved.")
+		return true, nil
+	}); err != nil {
+		t.Logf("Failed to verify that DNS has been correctly set.")
+	} else {
+		return
+	}
+	t.Fatalf("All nameservers failed to verify that DNS has been correctly set.")
 }
 
 // HELPER FUNCTIONS

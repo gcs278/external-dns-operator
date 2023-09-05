@@ -4,6 +4,7 @@
 package e2e
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -15,8 +16,12 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/kubernetes"
 
 	ibclient "github.com/infobloxopen/infoblox-go-client"
 	"github.com/miekg/dns"
@@ -38,6 +43,10 @@ import (
 	"github.com/openshift/external-dns-operator/pkg/utils"
 )
 
+const (
+	googleDNSServer = "8.8.8.8"
+)
+
 type providerTestHelper interface {
 	ensureHostedZone(string) (string, []string, error)
 	deleteHostedZone(string, string) error
@@ -46,6 +55,7 @@ type providerTestHelper interface {
 	buildExternalDNS(name, zoneID, zoneDomain string, credsSecret *corev1.Secret) operatorv1beta1.ExternalDNS
 	buildOpenShiftExternalDNS(name, zoneID, zoneDomain, routeName string, credsSecret *corev1.Secret) operatorv1beta1.ExternalDNS
 	buildOpenShiftExternalDNSV1Alpha1(name, zoneID, zoneDomain, routeName string, credsSecret *corev1.Secret) operatorv1alpha1.ExternalDNS
+	getDNSRecordValuesWithAssumeRole(assumeRoleARN, zoneId, recordName, recordType string) (map[string]struct{}, error)
 }
 
 func randomString(n int) string {
@@ -455,4 +465,202 @@ func ensureEnvVar(vars []corev1.EnvVar, v corev1.EnvVar) []corev1.EnvVar {
 		}
 	}
 	return append(vars, v)
+}
+
+// dnsQueryClusterInternal queries for a DNS hostname inside the VPC of a cluster using a dig pod. It returns a
+// map structure of the resolved IPs for easy lookup.
+func dnsQueryClusterInternal(ctx context.Context, t *testing.T, cl client.Client, cs *kubernetes.Clientset, namespace, hostname string) (map[string]struct{}, error) {
+	t.Helper()
+
+	clientPod := buildDigPod("digpod", namespace, hostname)
+	if err := cl.Create(ctx, clientPod); err != nil {
+		return nil, fmt.Errorf("failed to create pod %s/%s: %v", clientPod.Namespace, clientPod.Name, err)
+	}
+	defer func() {
+		_ = cl.Delete(ctx, clientPod)
+	}()
+
+	// Loop until dig pod starts, then parse logs for query results.
+	var responseCode string
+	var gotIPs map[string]struct{}
+	err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 10*time.Minute, true, func(ctx context.Context) (bool, error) {
+		if err := cl.Get(ctx, types.NamespacedName{Name: clientPod.Name, Namespace: clientPod.Namespace}, clientPod); err != nil {
+			t.Errorf("Failed to get pod %s/%s: %v", clientPod.Namespace, clientPod.Name, err)
+			return false, nil
+		}
+		switch clientPod.Status.Phase {
+		case corev1.PodRunning:
+			t.Log("Waiting for dig pod to finish")
+			return false, nil
+		case corev1.PodPending:
+			t.Log("Waiting for dig pod to start")
+			return false, nil
+		case corev1.PodFailed, corev1.PodSucceeded:
+			// Failed or Succeeded, let's continue on to check the logs.
+			break
+		default:
+			return true, fmt.Errorf("unhandled pod status type")
+		}
+
+		// Get logs of the dig pod.
+		readCloser, err := cs.CoreV1().Pods(clientPod.Namespace).GetLogs(clientPod.Name, &corev1.PodLogOptions{
+			Container: clientPod.Spec.Containers[0].Name,
+			Follow:    false,
+		}).Stream(ctx)
+		if err != nil {
+			t.Logf("Failed to read output from pod %s: %v (retrying)", clientPod.Name, err)
+			return false, nil
+		}
+		scanner := bufio.NewScanner(readCloser)
+		defer func() {
+			if err := readCloser.Close(); err != nil {
+				t.Fatalf("Failed to close reader for pod %s: %v", clientPod.Name, err)
+			}
+		}()
+
+		gotIPs = make(map[string]struct{})
+		for scanner.Scan() {
+			line := scanner.Text()
+
+			// Skip blank lines.
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			// Parse status out (helpful for future debugging)
+			if strings.HasPrefix(line, ";;") && strings.Contains(line, "status:") {
+				responseCodeSection := strings.TrimSpace(strings.Split(line, ",")[1])
+				responseCode = strings.Split(responseCodeSection, " ")[1]
+				t.Logf("DNS Response Code: %s", responseCode)
+			}
+			// If it doesn't begin with ";", then we have an answer.
+			if !strings.HasPrefix(line, ";") {
+				splitAnswer := strings.Fields(line)
+				if len(splitAnswer) < 5 {
+					t.Logf("Expected dig answer to have 5 fields: %q", line)
+					return true, nil
+				}
+				gotIP := strings.Fields(line)[4]
+				gotIPs[gotIP] = struct{}{}
+			}
+		}
+		t.Logf("Got IPs: %v", gotIPs)
+		return true, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to observe the expected dig results: %v", err)
+	}
+
+	// Need to delete pod in case we start again.
+	waitForDeletion(ctx, t, cl, clientPod, 5*time.Minute)
+
+	return gotIPs, nil
+}
+
+// buildDigPod returns a pod definition for a pod with the given name and image
+// and in the given namespace that digs the specified address.
+func buildDigPod(name, namespace, address string, extraArgs ...string) *corev1.Pod {
+	digArgs := []string{
+		"+noall",
+		"+answer",
+		"+comments",
+	}
+	digArgs = append(digArgs, extraArgs...)
+	digArgs = append(digArgs, address)
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:    "dig",
+					Image:   "openshift/origin-node",
+					Command: []string{"/bin/dig"},
+					Args:    digArgs,
+					SecurityContext: &corev1.SecurityContext{
+						Capabilities: &corev1.Capabilities{
+							Drop: []corev1.Capability{"ALL"},
+						},
+						Privileged:               pointer.Bool(false),
+						RunAsNonRoot:             pointer.Bool(true),
+						AllowPrivilegeEscalation: pointer.Bool(false),
+						SeccompProfile: &corev1.SeccompProfile{
+							Type: corev1.SeccompProfileTypeRuntimeDefault,
+						},
+					},
+				},
+			},
+			RestartPolicy: corev1.RestartPolicyNever,
+		},
+	}
+}
+
+// getServiceIPs retrieves the provided service's IP or hostname and resolves the hostname to IPs (if applicable).
+// Returns values are the serviceAddress (LoadBalancer IP or Hostname), the service resolved IPs, and an error
+// (if applicable).
+func getServiceIPs(ctx context.Context, t *testing.T, cl client.Client, timeout time.Duration, svcName types.NamespacedName) (string, map[string]struct{}, error) {
+	t.Helper()
+
+	// Get the IPs of the loadbalancer which is created for the service
+	var serviceAddress string
+	serviceResolvedIPs := make(map[string]struct{})
+	if err := wait.PollUntilContextTimeout(ctx, 10*time.Second, timeout, true, func(ctx context.Context) (done bool, err error) {
+		t.Log("Getting IPs of service's load balancer")
+		var service corev1.Service
+		err = cl.Get(ctx, svcName, &service)
+		if err != nil {
+			return false, err
+		}
+
+		// If there is no associated loadbalancer then retry later
+		if len(service.Status.LoadBalancer.Ingress) < 1 {
+			return false, nil
+		}
+
+		// Get the IPs of the loadbalancer
+		if service.Status.LoadBalancer.Ingress[0].IP != "" {
+			serviceAddress = service.Status.LoadBalancer.Ingress[0].IP
+			serviceResolvedIPs[service.Status.LoadBalancer.Ingress[0].IP] = struct{}{}
+		} else if service.Status.LoadBalancer.Ingress[0].Hostname != "" {
+			lbHostname := service.Status.LoadBalancer.Ingress[0].Hostname
+			serviceAddress = lbHostname
+			ips, err := lookupARecord(lbHostname, googleDNSServer)
+			if err != nil {
+				t.Logf("Waiting for IP of loadbalancer %s", lbHostname)
+				// If the hostname cannot be resolved currently then retry later
+				return false, nil
+			}
+			for _, ip := range ips {
+				serviceResolvedIPs[ip] = struct{}{}
+			}
+		} else {
+			t.Logf("Waiting for loadbalancer details for service %s", svcName.Name)
+			return false, nil
+		}
+		t.Logf("Loadbalancer's IP(s): %v", serviceResolvedIPs)
+		return true, nil
+	}); err != nil {
+		return "", nil, fmt.Errorf("failed to get loadbalancer IPs for service %s/%s: %v", svcName.Name, svcName.Namespace, err)
+	}
+
+	return serviceAddress, serviceResolvedIPs, nil
+}
+
+// waitForDeletion deletes an object and waits for it to be no longer found.
+func waitForDeletion(ctx context.Context, t *testing.T, cl client.Client, obj client.Object, timeout time.Duration) {
+	t.Helper()
+	deletionPolicy := metav1.DeletePropagationForeground
+	_ = wait.PollUntilContextTimeout(ctx, 10*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+		err := cl.Delete(ctx, obj, &client.DeleteOptions{PropagationPolicy: &deletionPolicy})
+		if err != nil && !errors.IsNotFound(err) {
+			t.Logf("failed to delete resource %s/%s: %v", obj.GetNamespace(), obj.GetName(), err)
+			return false, nil
+		} else if err == nil {
+			t.Logf("retrying deletion of resource %s/%s", obj.GetNamespace(), obj.GetName())
+			return false, nil
+		}
+		t.Logf("deleted resource %s/%s", obj.GetNamespace(), obj.GetName())
+		return true, nil
+	})
 }

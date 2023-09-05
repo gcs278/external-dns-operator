@@ -330,3 +330,7 @@ func (h *infobloxTestHelper) trustGridTLSCert(kubeClient client.Client) error {
 
 	return nil
 }
+
+func (h *infobloxTestHelper) getDNSRecordValuesWithAssumeRole(assumeRoleARN, zoneId, recordName, recordType string) (map[string]struct{}, error) {
+	panic("not implemented")
+}
